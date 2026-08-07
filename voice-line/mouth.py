@@ -9,6 +9,10 @@ Two engines:
   kokoro      free, local, $0 forever. Raw PCM int16 24k mono straight from
               the server into sounddevice.
 
+  piper       free, local, IN-PROCESS. No server, no HTTP hop, ~25x realtime
+              — about 3x Kokoro. The model is loaded once and cached; loading
+              costs ~0.6s and must not happen per sentence.
+
   elevenlabs  higher quality, needs ELEVENLABS_API_KEY. Hard-won doctrine:
               - fetch mp3_44100_128 and decode locally with ffmpeg. Raw PCM
                 at 44.1k needs their Pro tier, and the mp3 decode hides
@@ -27,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import time
 import subprocess
 
 import httpx
@@ -45,6 +50,10 @@ from config import (
     KOKORO_SAMPLE_RATE,
     KOKORO_URL,
     KOKORO_VOICE,
+    PIPER_ESPEAK_DATA,
+    PIPER_MODEL,
+    PIPER_SAMPLE_RATE,
+    PIPER_SPEAKER,
     SPEECH_SPEED,
     TTS_ENGINE,
 )
@@ -72,6 +81,12 @@ class Mouth:
         self._api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
         self.on_idle = None  # optional callback fired when the queue drains
 
+        self._piper = None          # lazily loaded, then cached
+        self._piper_dead = False
+
+        if self.engine == "piper" and not PIPER_MODEL.exists():
+            print(f"  [piper model missing at {PIPER_MODEL} — using Kokoro]")
+            self.engine = "kokoro"
         if self.engine == "elevenlabs" and not self._api_key:
             print("  [no ELEVENLABS_API_KEY set — using Kokoro]")
             self.engine = "kokoro"
@@ -87,6 +102,23 @@ class Mouth:
 
     def start(self) -> None:
         self._worker = asyncio.create_task(self._run())
+
+    def warm(self) -> float:
+        """Load the TTS model now so the first sentence does not pay for it.
+
+        Piper loads in ~0.6s but the first synthesise call measured 2.2s cold
+        versus 0.15s warm. Left unwarmed that lands squarely on the first
+        thing the person hears — the same cold-start trap as the microphone.
+        Called at launch, off-thread, behind the spoken greeting.
+        """
+        t0 = time.monotonic()
+        if self.engine == "piper":
+            try:
+                self._load_piper()
+            except Exception as exc:
+                print(f"  [piper preload failed: {exc} — using Kokoro]")
+                self.engine = "kokoro"
+        return time.monotonic() - t0
 
     def say(self, text: str) -> None:
         """Queue a sentence. Returns immediately."""
@@ -157,6 +189,13 @@ class Mouth:
     # -- synthesis ------------------------------------------------------
 
     async def _synth(self, text: str) -> tuple[np.ndarray | None, int]:
+        if self.engine == "piper" and not self._piper_dead:
+            pcm = await asyncio.to_thread(self._synth_piper, text)
+            if pcm is not None:
+                return pcm, PIPER_SAMPLE_RATE
+            print("  [piper failed — falling back to kokoro]")
+            self._piper_dead = True
+
         if self.engine == "elevenlabs" and not self._eleven_dead:
             pcm = await self._synth_eleven(text)
             if pcm is not None:
@@ -165,6 +204,51 @@ class Mouth:
             print("  [elevenlabs failed — falling back to kokoro]")
             self._eleven_dead = True
         return await self._synth_kokoro(text), KOKORO_SAMPLE_RATE
+
+    def _load_piper(self):
+        """Load once, cache forever. Loading costs ~0.6s."""
+        if self._piper is not None:
+            return self._piper
+        # Must be set BEFORE the import: piper resolves espeak data at load
+        # time from a path baked on its build machine, which does not exist
+        # here. See PIPER_ESPEAK_DATA in config.py.
+        if os.path.isdir(PIPER_ESPEAK_DATA):
+            os.environ.setdefault("ESPEAK_DATA_PATH", PIPER_ESPEAK_DATA)
+        from piper import PiperVoice
+        self._piper = PiperVoice.load(
+            str(PIPER_MODEL), config_path=str(PIPER_MODEL) + ".json"
+        )
+        return self._piper
+
+    def _synth_piper(self, text: str) -> np.ndarray | None:
+        """Synchronous — callers wrap it in a thread so the loop keeps running."""
+        try:
+            from piper import SynthesisConfig
+            voice = self._load_piper()
+            # length_scale is the INVERSE of speed: smaller is faster.
+            cfg = SynthesisConfig(length_scale=1.0 / max(0.25, SPEECH_SPEED))
+            if PIPER_SPEAKER is not None:
+                cfg = SynthesisConfig(
+                    length_scale=1.0 / max(0.25, SPEECH_SPEED),
+                    speaker_id=self._piper_speaker_id(),
+                )
+            chunks = [np.frombuffer(c.audio_int16_bytes, dtype=np.int16)
+                      for c in voice.synthesize(text, syn_config=cfg)]
+            if not chunks:
+                return None
+            return np.concatenate(chunks)
+        except Exception as exc:
+            print(f"\n  [piper error: {exc}]")
+            return None
+
+    def _piper_speaker_id(self):
+        import json
+        m = json.loads((str(PIPER_MODEL) + ".json") and
+                       open(str(PIPER_MODEL) + ".json").read())
+        smap = m.get("speaker_id_map") or {}
+        if isinstance(PIPER_SPEAKER, int):
+            return PIPER_SPEAKER
+        return smap.get(PIPER_SPEAKER, 0)
 
     async def _synth_kokoro(self, text: str) -> np.ndarray | None:
         try:

@@ -55,12 +55,36 @@ TARGET_PEAK = 12000.0         # int16; ~37% of full scale, safely below clipping
 MAX_GAIN = 12.0
 
 # --- voice -------------------------------------------------------------
-# "kokoro" = free local, $0 forever. "elevenlabs" = higher quality, needs
-# ELEVENLABS_API_KEY in the environment. ElevenLabs falls back to Kokoro
-# automatically on any failure, so the voice degrades instead of going mute.
-TTS_ENGINE = "kokoro"
+# "piper"      free, local, IN-PROCESS. Fastest by a distance (~25x realtime
+#              vs Kokoro's ~8x) and needs no server, so it also drops an HTTP
+#              round trip from every sentence.
+# "kokoro"     free, local, runs as a server on :8880. 68 voices.
+# "elevenlabs" highest quality, needs ELEVENLABS_API_KEY in the environment.
+#
+# Every engine falls back to Kokoro on any failure, so the voice degrades
+# instead of going mute.
+TTS_ENGINE = "piper"
 
 KOKORO_VOICE = "bm_daniel"
+
+# --- piper -------------------------------------------------------------
+# Models live in ./models and are gitignored. Grab more from
+# https://huggingface.co/rhasspy/piper-voices — drop the .onnx and the
+# matching .onnx.json in, then point PIPER_MODEL at it.
+# en_GB-alan-medium is the British male the isair/jarvis project uses.
+PIPER_MODEL = PROJECT_ROOT / "models" / "en_GB-alan-medium.onnx"
+PIPER_SAMPLE_RATE = 22050     # piper medium models are 22.05kHz, not 24k
+
+# Multi-speaker models (vctk, semaine) need a speaker name or index; None for
+# single-speaker models like alan.
+PIPER_SPEAKER = None
+
+# THE GOTCHA: piper 1.6 hardcodes an espeak-ng data path from its own build
+# machine and dies instantly on macOS with "No such file or directory:
+# .../espeak-ng-data/phontab". Homebrew's copy is already present because
+# Kokoro pulled espeak-ng in. mouth.py sets this into the environment before
+# loading the model.
+PIPER_ESPEAK_DATA = "/opt/homebrew/opt/espeak-ng/share/espeak-ng-data"
 
 # Speaking rate. 1.0 is Kokoro's default and reads a touch slow for a desk
 # assistant; 1.15 is noticeably brisker while still natural. Above ~1.35 it

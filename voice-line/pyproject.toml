@@ -6,6 +6,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.131",
     "httpx>=0.28.1",
     "numpy>=2.5.1",
+    "piper-tts>=1.6.0",
     "pynput>=1.8.2",
     "setuptools<81",
     "sounddevice>=0.5.5",

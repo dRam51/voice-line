@@ -425,6 +425,10 @@ class VoiceLine:
         # opens in ~90ms like every other one. See Ears.warm().
         mic_ms = await asyncio.to_thread(self.ears.warm)
         log(f"mic warmed in {mic_ms*1000:.0f}ms")
+        # Same trap as the mic: an unloaded TTS model puts its whole load cost
+        # on the first sentence the person hears. Pay it here instead.
+        tts_ms = await asyncio.to_thread(self.mouth.warm)
+        log(f"tts model warmed in {tts_ms*1000:.0f}ms (engine={self.mouth.engine})")
         if mic_ms > 1.0:
             print(f"  [mic device warmed in {mic_ms:.1f}s]")
         log("entering race loop — ready for input")
@@ -513,8 +517,9 @@ def parse_args():
     p = argparse.ArgumentParser(prog="voice-line")
     p.add_argument("--open-mic", action="store_true",
                    help="legacy hands-free VAD mode instead of hold-to-talk")
-    p.add_argument("--voice", default=TTS_ENGINE, choices=["kokoro", "elevenlabs"],
-                   help="TTS engine (elevenlabs falls back to kokoro on failure)")
+    p.add_argument("--voice", default=TTS_ENGINE,
+                   choices=["piper", "kokoro", "elevenlabs"],
+                   help="TTS engine; all fall back to kokoro on failure")
     p.add_argument("--cwd", default=None,
                    help="session working directory (defaults to config.SESSION_CWD)")
     p.add_argument("--no-duck", action="store_true", help="disable Spotify ducking")
