@@ -1,0 +1,18 @@
+# Runtime state and logs — debug.log contains verbatim transcripts of speech.
+debug.log
+*.log
+.voice_state
+.voice_waveform
+.voice_loading_pid
+.voice_alert
+
+# Environments and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Models are downloaded, never committed
+*.onnx
+*.onnx.json
+*.pt
+*.bin

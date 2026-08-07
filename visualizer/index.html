@@ -1,0 +1,501 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>voice-visualizer · matrix</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}
+  canvas{display:block;width:100vw;height:100vh}
+  #tag{position:fixed;left:14px;bottom:12px;font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.18em;color:#00ff41;opacity:.55;text-shadow:0 0 8px rgba(0,255,65,.6);
+    pointer-events:none;user-select:none}
+  #fps{position:fixed;right:14px;bottom:12px;font:600 12px ui-monospace,Menlo,monospace;
+    color:#00ff41;opacity:.55;display:none;pointer-events:none}
+</style>
+<canvas id="c"></canvas>
+<div id="tag">IDLE</div>
+<div id="fps">--</div>
+<script>
+"use strict";
+/* ==========================================================================
+   voice-visualizer — matrix rain
+   Reads /state ~10x/sec. Everything is driven by ONE eased energy value so
+   no state change ever reads as a jump cut. Glyphs are baked once into an
+   offscreen atlas at load and blitted per frame; nothing is rasterised in
+   the render loop.
+   ========================================================================== */
+
+const Q = new URLSearchParams(location.search);
+const MOCKSTATE = Q.get('mockstate');            // simulate locally, no /state
+const SHOT      = Q.get('shot');                 // deterministic frame render
+const SHOT_T    = parseFloat(Q.get('t') || '1200');
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d', { alpha: false });
+const tagEl = document.getElementById('tag');
+const fpsEl = document.getElementById('fps');
+
+/* ------------------------------------------------------------- constants */
+const GREEN      = [0, 255, 65];      // canonical phosphor
+const CYAN       = [120, 240, 255];   // listening tint
+const RED        = [255, 40, 40];     // alert
+/* Cell size scales with the viewport so the number of glyphs on screen stays
+   roughly constant. Fixed cell sizes looked fine at 1280x760 but cost
+   37ms/frame at 2560x1440 — ~27fps — because columns AND rows both grew.
+   Targeting a constant column count keeps the budget flat on any display,
+   and bigger glyphs read better on a big screen anyway. */
+const TARGET_COLS = 92;
+let CELL_W = 17, CELL_H = 21, FONT_PX = 17;
+function pickCellSize() {
+  CELL_W = Math.max(13, Math.min(34, Math.round(W / TARGET_COLS)));
+  CELL_H = Math.round(CELL_W * 1.26);
+  FONT_PX = CELL_W;
+}
+const LEVELS     = 10;                // baked brightness steps
+const CHARSET    =
+  'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789:.=*+-<>¦｜╌';
+const N_CH       = CHARSET.length;
+const WORDS      = ['DECRYPTING','TRACE','0x7F3A','ACCESS','SIGNAL','NO LOGS',
+                    'KEYSPACE','ROUTE','SHA256','ENTROPY','HANDSHAKE'];
+
+/* Per-state targets. Glow and motion are SEPARATE axes on purpose:
+   speaking wants full glow at a calm cruise, thinking wants full speed. */
+const TARGETS = {
+  idle:      { glow: 0.22, motion: 0.20, density: 0.52, cyan: 0, red: 0, dir: +1 },
+  listening: { glow: 0.52, motion: 0.55, density: 0.78, cyan: 1, red: 0, dir: -1 },
+  thinking:  { glow: 0.58, motion: 1.00, density: 1.00, cyan: 0, red: 0, dir: +1 },
+  speaking:  { glow: 1.00, motion: 0.46, density: 0.92, cyan: 0, red: 0, dir: +1 },
+  alert:     { glow: 1.00, motion: 0.88, density: 1.00, cyan: 0, red: 1, dir: +1 },
+};
+const ATTACK = 0.5, RELEASE = 1.0;   // seconds
+
+/* --------------------------------------------------------------- state */
+let W = 0, H = 0, DPR = 1, COLS = 0, ROWS = 0;
+let atlases = {}, atlasCharW = 0, atlasCharH = 0;
+let vignette = null;   // baked once at resize, blitted per frame
+let columns = [];
+let level = 0, levelSmooth = 0, samples = null;
+let serverState = 'idle', alertFlag = false;
+let lastStateOk = 0;                 // last time /state answered
+let booting = true, bootT = 0;
+const PAGE_START = performance.now();
+const BOOT_SEC = 2.0;
+
+const eased = { glow: 0.22, motion: 0.20, density: 0.52, cyan: 0, red: 0, dir: 1 };
+
+/* ------------------------------------------------------------ the atlas */
+function bakeAtlas(rgb, headRgb) {
+  const cw = atlasCharW, ch = atlasCharH;
+  const a = document.createElement('canvas');
+  a.width = cw * N_CH; a.height = ch * (LEVELS + 1);
+  const g = a.getContext('2d');
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = `${Math.round(FONT_PX * DPR)}px "Hiragino Kaku Gothic ProN","MS Gothic",ui-monospace,monospace`;
+  for (let l = 0; l < LEVELS; l++) {
+    const alpha = Math.pow((l + 1) / LEVELS, 1.6);
+    g.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;
+    for (let i = 0; i < N_CH; i++) g.fillText(CHARSET[i], i * cw + cw / 2, l * ch + ch / 2);
+  }
+  // head row: the bright leading glyph, in this palette's hot colour
+  g.fillStyle = `rgb(${headRgb[0]},${headRgb[1]},${headRgb[2]})`;
+  for (let i = 0; i < N_CH; i++) g.fillText(CHARSET[i], i * cw + cw / 2, LEVELS * ch + ch / 2);
+  return a;
+}
+
+function buildAtlas() {
+  // Baked once per palette at load. The earlier version baked WHITE glyphs
+  // and tinted with a full-screen 'multiply' every frame — that single pass
+  // cost more than every glyph combined on a large display. Pre-coloured
+  // atlases remove it completely.
+  atlasCharW = Math.ceil(CELL_W * DPR);
+  atlasCharH = Math.ceil(CELL_H * DPR);
+  atlases = {
+    green: bakeAtlas(GREEN, [210, 255, 220]),
+    cyan:  bakeAtlas(CYAN,  [223, 247, 255]),
+    red:   bakeAtlas(RED,   [255, 214, 214]),
+  };
+}
+
+function buildVignette() {
+  // The alert bleed was a full-screen radial gradient recomputed every
+  // frame, which is pure fill-rate. Bake it once, blit it with alpha.
+  const v = document.createElement('canvas');
+  v.width = Math.max(1, Math.floor(W)); v.height = Math.max(1, Math.floor(H));
+  const g = v.getContext('2d');
+  const vg = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.18,
+                                    W / 2, H / 2, Math.max(W, H) * 0.75);
+  vg.addColorStop(0, 'rgba(255,0,0,0)');
+  vg.addColorStop(1, 'rgba(180,0,0,1)');
+  g.fillStyle = vg; g.fillRect(0, 0, W, H);
+  vignette = v;
+}
+
+/* ------------------------------------------------------------- columns */
+function makeColumns() {
+  COLS = Math.ceil(W / CELL_W) + 1;
+  ROWS = Math.ceil(H / CELL_H) + 2;
+  columns = new Array(COLS);
+  for (let i = 0; i < COLS; i++) columns[i] = newColumn(i, true);
+}
+function newColumn(i, scatter) {
+  return {
+    head: scatter ? rand() * ROWS : -rand() * 18,
+    speed: 0.35 + rand() * 0.75,
+    len: 8 + Math.floor(rand() * 22),
+    glyphs: new Int16Array(64).map(() => (rand() * N_CH) | 0),
+    mutate: 0,
+    active: rand() < 0.6,
+    word: null, wordT: 0,
+  };
+}
+/* deterministic rng so ?shot= renders identically every time */
+let _seed = 1337;
+function rand() {
+  _seed |= 0; _seed = (_seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(_seed ^ (_seed >>> 15), 1 | _seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+/* ---------------------------------------------------------------- sizing */
+function resize() {
+  // Cap harder on large displays. 1.25 on a 3456px panel means a 4320px
+  // canvas, and every full-screen composite then costs 12M pixels.
+  const rawDpr = window.devicePixelRatio || 1;
+  DPR = Math.min(rawDpr, window.innerWidth > 2000 ? 1.0 : 1.25);
+  W = window.innerWidth; H = window.innerHeight;
+  pickCellSize();
+  cv.width = Math.floor(W * DPR); cv.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  buildAtlas();
+  buildVignette();
+  makeColumns();
+  // Headless Chrome fires a late resize that would otherwise leave a blank
+  // canvas after a synchronous ?shot= render. Re-render on every resize.
+  if (SHOT) renderShot();
+}
+window.addEventListener('resize', resize);
+
+/* ------------------------------------------------------------ /state I/O */
+async function poll() {
+  if (MOCKSTATE || SHOT) return;
+  try {
+    const r = await fetch('/state', { cache: 'no-store' });
+    if (!r.ok) throw new Error('bad status');
+    const j = await r.json();
+    serverState = j.state || 'idle';
+    alertFlag = !!j.alert;
+    level = typeof j.level === 'number' ? j.level : 0;
+    samples = Array.isArray(j.samples) && j.samples.length ? j.samples : null;
+    lastStateOk = performance.now();
+  } catch (_e) {
+    /* leave values alone; the staleness check below eases us home */
+  }
+}
+if (!MOCKSTATE && !SHOT) { poll(); setInterval(poll, 100); }
+
+function currentState() {
+  if (MOCKSTATE) return MOCKSTATE;
+  if (SHOT) return SHOT;
+  // If /state has gone quiet, ease back to idle on our own.
+  if (performance.now() - lastStateOk > 2000) return 'idle';
+  return alertFlag ? 'alert' : serverState;
+}
+
+/* -------------------------------------------------------------- easing */
+function ease(cur, tgt, dt) {
+  const tau = tgt > cur ? ATTACK : RELEASE;
+  return cur + (tgt - cur) * (1 - Math.exp(-dt / tau));
+}
+
+function updateEnergy(dt, st) {
+  const T = TARGETS[st] || TARGETS.idle;
+  // Simulated level for mock/shot; real level comes from the bus.
+  let lv = level;
+  if (MOCKSTATE || SHOT) {
+    lv = st === 'speaking'
+      ? Math.max(0, 0.55 + 0.45 * Math.sin(simT * 0.004) * Math.sin(simT * 0.0011))
+      : 0;
+  }
+  levelSmooth += (lv - levelSmooth) * (1 - Math.exp(-dt / 0.09));  // ~90ms
+
+  eased.glow    = ease(eased.glow,    T.glow,    dt);
+  eased.motion  = ease(eased.motion,  T.motion,  dt);
+  eased.density = ease(eased.density, T.density, dt);
+  eased.cyan    = ease(eased.cyan,    T.cyan,    dt);
+  eased.red     = ease(eased.red,     T.red,     dt);
+  // Easing direction through zero makes the rain visibly stall and reverse
+  // instead of snapping — that transition is half the charm of listening.
+  eased.dir     = ease(eased.dir,     T.dir,     dt * 1.6);
+}
+
+/* ------------------------------------------------- waveform-of-glyphs map */
+function envelopeAt(colIdx) {
+  // Map this column onto one of the 64 waveform bins.
+  const u = colIdx / Math.max(1, COLS - 1);
+  let v;
+  if (samples && samples.length) {
+    const f = u * (samples.length - 1);
+    const i0 = Math.floor(f), i1 = Math.min(samples.length - 1, i0 + 1);
+    const frac = f - i0;
+    const s = (Math.abs(samples[i0]) * (1 - frac) + Math.abs(samples[i1]) * frac);
+    v = Math.min(1, s / 9000);
+  } else {
+    // No sample passthrough — synthesise something voice-shaped from level.
+    v = Math.abs(Math.sin(u * 9.1 + simT * 0.006) * 0.5
+              + Math.sin(u * 3.3 - simT * 0.004) * 0.5) * levelSmooth;
+  }
+  // Taper at the screen edges so the waveform reads as a shape, not a wall.
+  return v * (0.35 + 0.65 * Math.sin(u * Math.PI));
+}
+
+/* --------------------------------------------------------------- render */
+let simT = 0;
+function step(dt) {
+  simT += dt * 1000;
+  const st = currentState();
+  updateEnergy(dt, st);
+
+  const speaking = eased.glow > 0.55 && levelSmooth > 0.02;
+  const wantActive = eased.density;
+
+  for (let i = 0; i < COLS; i++) {
+    const c = columns[i];
+
+    // density gate: columns switch on/off gradually as density eases
+    const hash = ((i * 2654435761) >>> 0) / 4294967296;
+    c.active = hash < wantActive;
+    if (!c.active) continue;
+
+    // SPEAKING: each column rides its own slice of the voice
+    let boost = 1;
+    if (speaking) boost = 0.35 + 1.9 * envelopeAt(i);
+
+    const px = eased.motion * c.speed * boost * eased.dir;
+    c.head += px * dt * 34;
+
+    // wrap
+    if (eased.dir >= 0) {
+      if (c.head - c.len > ROWS) { c.head = -rand() * 10; c.speed = 0.35 + rand() * 0.75; }
+    } else {
+      if (c.head + c.len < 0) { c.head = ROWS + rand() * 10; c.speed = 0.35 + rand() * 0.75; }
+    }
+
+    // glyph mutation — faster when thinking
+    c.mutate -= dt * (1.2 + 9 * eased.motion);
+    if (c.mutate <= 0) {
+      c.mutate = 0.5 + rand() * 0.5;
+      c.glyphs[(rand() * c.glyphs.length) | 0] = (rand() * N_CH) | 0;
+    }
+
+    // THINKING: columns briefly lock into readable fragments
+    if (st === 'thinking') {
+      if (!c.word && rand() < dt * 0.55) {
+        c.word = WORDS[(rand() * WORDS.length) | 0];
+        c.wordT = 0.7 + rand() * 0.6;
+      }
+    }
+    if (c.word) { c.wordT -= dt; if (c.wordT <= 0) c.word = null; }
+  }
+
+  // Wall clock, NOT accumulated dt. Summing frame deltas meant a few slow
+  // early frames could leave the boot screen up indefinitely — i.e. a black
+  // screen with no rain, which is indistinguishable from "it's broken".
+  if (booting) {
+    bootT = (performance.now() - PAGE_START) / 1000;
+    if (bootT > BOOT_SEC) booting = false;
+  }
+}
+
+function tint() {
+  // Blend green -> cyan (listening) -> red (alert) on one eased axis each.
+  const m = (a, b, t) => a + (b - a) * t;
+  let r = GREEN[0], g = GREEN[1], b = GREEN[2];
+  r = m(r, CYAN[0], eased.cyan); g = m(g, CYAN[1], eased.cyan); b = m(b, CYAN[2], eased.cyan);
+  r = m(r, RED[0], eased.red);   g = m(g, RED[1], eased.red);   b = m(b, RED[2], eased.red);
+  return [r | 0, g | 0, b | 0];
+}
+
+function paletteWeights() {
+  // Which baked atlas(es) to draw from this frame. Usually exactly one has
+  // meaningful weight; during a transition two overlap and crossfade.
+  const red = eased.red, cyan = eased.cyan * (1 - red);
+  return [
+    ['green', (1 - cyan - red)],
+    ['cyan',  cyan],
+    ['red',   red],
+  ].filter(([, w]) => w > 0.015);
+}
+
+function draw() {
+  const st = currentState();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  if (booting) { drawBoot(); return; }
+
+  const speaking = eased.glow > 0.55 && levelSmooth > 0.02;
+  const pal = paletteWeights();
+  const heads = [];
+
+  for (const [name, weight] of pal) {
+    const atl = atlases[name];
+    ctx.globalAlpha = weight;
+    for (let i = 0; i < COLS; i++) {
+      const c = columns[i];
+      if (!c.active) continue;
+      const x = i * CELL_W;
+      const len = Math.max(3, Math.round(c.len * (0.55 + 0.75 * eased.density)));
+
+      for (let k = 1; k < len; k++) {
+        const row = Math.round(c.head) - k * (eased.dir >= 0 ? 1 : -1);
+        const y = row * CELL_H;
+        if (y < -CELL_H || y > H + CELL_H) continue;
+        let lvl = Math.round((1 - k / len) * (LEVELS - 1) * (0.30 + 0.70 * eased.glow));
+        if (speaking) lvl = Math.round(lvl * 0.5);
+        let gi = c.glyphs[k % c.glyphs.length];
+        if (c.word) {
+          const wi = CHARSET.indexOf(c.word[k % c.word.length]);
+          if (wi >= 0) gi = wi;
+        }
+        blitFrom(atl, gi, lvl, x, y);
+      }
+
+      if (weight === pal[0][1]) {
+        // collect heads once, not per palette
+        const hy = Math.round(c.head) * CELL_H;
+        if (hy > -CELL_H && hy < H + CELL_H)
+          heads.push([x, hy, c.glyphs[0], false, 1]);
+
+        // THE WAVEFORM OF GLYPHS — its own layer. Relying on trails to fall
+        // inside the envelope left it invisible; filling it directly is the
+        // only way the shape reads.
+        if (speaking) {
+          const env = envelopeAt(i);
+          const bandY = H * 0.5, bandH = 10 + env * H * 0.42;
+          if (bandH > 12) {
+            const y0 = Math.floor((bandY - bandH) / CELL_H) * CELL_H;
+            for (let y = y0; y <= bandY + bandH; y += CELL_H) {
+              if (y < -CELL_H || y > H + CELL_H) continue;
+              const ri = Math.round(y / CELL_H);
+              const d = Math.abs(y - bandY) / bandH;
+              heads.push([x, y, c.glyphs[(ri + i) % c.glyphs.length], true, 1 - d * 0.6]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // heads + waveform glyphs, hot, on top
+  const headAtlas = atlases[pal[0][0]];
+  ctx.globalCompositeOperation = 'lighter';
+  for (const [x, y, gi, inBand, a] of heads) {
+    ctx.globalAlpha = inBand ? a * (0.5 + 0.5 * eased.glow) : 0.8 + 0.2 * eased.glow;
+    blitFrom(headAtlas, gi, LEVELS, x, y);
+    if (inBand) blitFrom(headAtlas, gi, LEVELS, x, y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+
+  if (eased.red > 0.01 && vignette) {
+    ctx.globalAlpha = 0.55 * eased.red;
+    ctx.drawImage(vignette, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  tagEl.textContent = st.toUpperCase();
+  const [tr, tg, tb] = pal[0][0] === 'red' ? RED : pal[0][0] === 'cyan' ? CYAN : GREEN;
+  tagEl.style.color = `rgb(${tr},${tg},${tb})`;
+}
+
+function blitFrom(atl, gi, lvl, x, y) {
+  if (lvl < 0) return;
+  ctx.drawImage(atl, gi * atlasCharW, lvl * atlasCharH, atlasCharW, atlasCharH,
+                x, y, CELL_W, CELL_H);
+}
+
+function blit(gi, lvl, x, y) {   // legacy helper, kept for the boot path
+  blitFrom(atlases.green, gi, lvl, x, y);
+}
+
+/* ---------------------------------------------------------- boot intro */
+const BOOT_LINE = 'WAKE UP...';
+function drawBoot() {
+  const p = Math.min(1, bootT / 1.1);
+  const n = Math.floor(p * BOOT_LINE.length);
+  ctx.font = `600 ${Math.round(Math.min(W, H) * 0.055)}px ui-monospace,Menlo,monospace`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  const txt = BOOT_LINE.slice(0, n);
+  const m = ctx.measureText(txt + '_').width;
+  ctx.fillStyle = '#00ff41';
+  ctx.shadowColor = 'rgba(0,255,65,.85)';
+  ctx.shadowBlur = 18;
+  ctx.fillText(txt, W / 2 - m / 2, H / 2);
+  if (Math.floor(bootT * 3) % 2 === 0) {
+    ctx.fillRect(W / 2 - m / 2 + ctx.measureText(txt).width + 3, H / 2 - 16, 14, 30);
+  }
+  ctx.shadowBlur = 0;
+  // rain cascades in over the last stretch
+  if (bootT > 1.3) {
+    const f = (bootT - 1.3) / 0.7;
+    ctx.fillStyle = `rgba(0,0,0,${1 - f})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+function skipBoot() { if (booting) { booting = false; bootT = 99; } }
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'f' || e.key === 'F') {
+    fpsEl.style.display = fpsEl.style.display === 'none' ? 'block' : 'none';
+    return;
+  }
+  skipBoot();
+});
+window.addEventListener('mousedown', skipBoot);
+
+/* ----------------------------------------------------------- main loop */
+let last = performance.now(), frames = 0, fpsT = 0;
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  step(dt);
+  draw();
+  frames++; fpsT += dt;
+  if (fpsT >= 0.5) { fpsEl.textContent = Math.round(frames / fpsT) + ' FPS'; frames = 0; fpsT = 0; }
+  requestAnimationFrame(loop);
+}
+
+/* ------------------------------------------------- deterministic ?shot= */
+function renderShot() {
+  booting = false;
+  _seed = 1337;
+  makeColumns();
+  // Snap the eased values to the target so a shot shows the settled state.
+  const T = TARGETS[SHOT] || TARGETS.idle;
+  Object.assign(eased, T);
+  simT = 0; levelSmooth = 0;
+  const dt = 1 / 60;
+  const steps = Math.max(1, Math.round(SHOT_T / 1000 * 60));
+  for (let i = 0; i < steps; i++) step(dt);
+  draw();
+  // Frame cost, so a headless run can prove the 60fps budget instead of
+  // us guessing. Anything under 16.6ms clears 60fps.
+  const t0 = performance.now();
+  const N = 20;
+  for (let i = 0; i < N; i++) { step(dt); draw(); }
+  const ms = (performance.now() - t0) / N;
+  fpsEl.textContent = ms.toFixed(2) + ' ms/frame';
+  fpsEl.id = 'fps';
+}
+
+resize();
+if (SHOT) {
+  renderShot();              // freeze — no rAF
+} else {
+  requestAnimationFrame(loop);
+}
+</script>
