@@ -3,7 +3,7 @@
 ## Launch
 
 ```bash
-~/voice-line/run-voice-line.sh
+~/Documents/home-lab/ai-voice-assistant/voice-line/run-voice-line.sh
 ```
 
 Starts whisper (:2022) and Kokoro (:8880) if they aren't already up, then runs
@@ -88,7 +88,7 @@ not run under launchd.
 
 ## Signal bus (for a visualizer)
 
-Files written in `~/voice-line/`:
+Files written in `~/Documents/home-lab/ai-voice-assistant/voice-line/`:
 
 - `.voice_state` — `idle` | `listening` | `thinking` | `speaking`
 - `.voice_waveform` — `{"ts": float, "samples": [64 floats]}`, ≤15/sec

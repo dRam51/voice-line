@@ -28,7 +28,10 @@ from pathlib import Path
 
 # ------------------------------------------------------------------ config
 HERE = Path(__file__).resolve().parent
-BUS_DIR = Path.home() / "voice-line"
+# The voice line writes the bus here. Derived from THIS file's location so
+# the pair can be moved together without editing paths — it used to be
+# hardcoded to ~/voice-line, which broke the moment the project moved.
+BUS_DIR = HERE.parent / "voice-line"
 STATE_FILE = BUS_DIR / ".voice_state"
 WAVEFORM_FILE = BUS_DIR / ".voice_waveform"
 ALERT_FILE = BUS_DIR / ".voice_alert"

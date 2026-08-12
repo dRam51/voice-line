@@ -228,7 +228,7 @@ async def t4_tool_turn():
 
     app.mouth.say = spy
     await app.handle(
-        "Read the file ~/voice-line/config.py and tell me what TTS_ENGINE is set to."
+        "Read the file config.py in the current working directory and tell me what TTS_ENGINE is set to."
     )
     total = time.time() - t0
 

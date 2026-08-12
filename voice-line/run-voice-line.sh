@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VOICE_LINE_DIR="$HOME/voice-line"
+VOICE_LINE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WHISPER_DIR="$HOME/whisper.cpp"
 KOKORO_DIR="$HOME/Kokoro-FastAPI"
 WHISPER_MODEL="models/ggml-small.en.bin"

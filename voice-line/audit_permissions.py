@@ -8,7 +8,7 @@ config check alone gave a WRONG answer once: ~/.claude.json showed "no MCP
 servers" while the session was holding 60 of them, including
 place_equity_order. Read the session, not the config.
 
-    cd ~/voice-line && uv run python audit_permissions.py
+    cd ~/Documents/home-lab/ai-voice-assistant/voice-line && uv run python audit_permissions.py
 """
 
 from __future__ import annotations
